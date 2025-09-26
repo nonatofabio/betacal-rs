@@ -1,0 +1,24 @@
+[package]
+name = "betacal-inference"
+version = "0.1.0"
+edition = "2021"
+authors = ["BetaCal Team"]
+license = "MIT"
+description = "High-performance inference engine for BetaCal probability calibration models"
+repository = "https://github.com/betacal/betacal-inference"
+keywords = ["machine-learning", "calibration", "inference", "probability"]
+categories = ["algorithms", "science"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
+criterion = "0.5"
+
+[[bench]]
+name = "inference_bench"
+harness = false

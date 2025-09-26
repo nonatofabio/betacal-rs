@@ -1,5 +1,6 @@
 # Compiled python modules.
 *.pyc
+__pycache__
 
 # Setuptools distribution folder.
 /dist/
@@ -11,3 +12,7 @@
 /python/.ipynb_checkpoints
 .ipynb_checkpoints
 .ipynb_checkpoints
+
+# Python Environments
+venv
+.venv

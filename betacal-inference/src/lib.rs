@@ -47,13 +47,19 @@ pub enum InferenceError {
 /// Calibration method used by the model
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum CalibrationMethod {
-    /// Both log(p) and log(1-p) features
+    /// ABM: Both log(p) and -log(1-p) features (3-parameter model)
+    #[serde(rename = "ABM")]
+    ABM,
+    /// AB: Both log(2p) and log(2(1-p)) features (2-parameter model, m=0.5)
     #[serde(rename = "AB")]
     AB,
-    /// Only log(p) feature
+    /// AM: log(p/(1-p)) feature (2-parameter model, a=b)
+    #[serde(rename = "AM")]
+    AM,
+    /// A: log(p/(1-p)) feature (1-parameter model, a=b, m=0.5)
     #[serde(rename = "A")]
     A,
-    /// Only log(1-p) feature
+    /// B: -log((1-p)/p) feature (1-parameter model, only b)
     #[serde(rename = "B")]
     B,
 }
@@ -225,8 +231,8 @@ impl BetaCalModel {
     /// Validate model parameters
     fn validate(&self) -> Result<(), InferenceError> {
         let expected_features = match self.method {
-            CalibrationMethod::AB => 2,
-            CalibrationMethod::A | CalibrationMethod::B => 1,
+            CalibrationMethod::ABM | CalibrationMethod::AB => 2,
+            CalibrationMethod::AM | CalibrationMethod::A | CalibrationMethod::B => 1,
         };
 
         if self.weights.len() != expected_features {
@@ -252,15 +258,20 @@ impl BetaCalModel {
     }
 
     /// Create feature vector based on calibration method
-    /// This matches the exact transformation from Python BetaCal:
-    /// x = np.hstack((df, 1. - df))
-    /// x = np.log(x)  
-    /// x[:, 1] *= -1  # Negate the second feature
+    /// This matches the exact transformation from Python BetaCal for each model type:
+    /// 
+    /// ABM: x = np.hstack((df, 1. - df)); x = np.log(x); x[:, 1] *= -1  → [log(p), -log(1-p)]
+    /// AB:  x = np.hstack((df, 1. - df)); x = np.log(2 * x)             → [log(2p), log(2(1-p))]
+    /// AM:  x = np.log(df / (1. - df))                                   → [log(p/(1-p))]
+    /// A:   x = np.log(df / (1. - df))                                   → [log(p/(1-p))]
+    /// B:   x = -np.log((1. - df) / df)                                  → [-log((1-p)/p)]
     fn create_features(&self, p: f64) -> Vec<f64> {
         match self.method {
-            CalibrationMethod::AB => vec![p.ln(), -(1.0 - p).ln()],  // [log(p), -log(1-p)]
-            CalibrationMethod::A => vec![p.ln()],                     // [log(p)]
-            CalibrationMethod::B => vec![-(1.0 - p).ln()],            // [-log(1-p)]
+            CalibrationMethod::ABM => vec![p.ln(), -(1.0 - p).ln()],           // [log(p), -log(1-p)]
+            CalibrationMethod::AB => vec![(2.0 * p).ln(), (2.0 * (1.0 - p)).ln()], // [log(2p), log(2(1-p))]
+            CalibrationMethod::AM => vec![(p / (1.0 - p)).ln()],               // [log(p/(1-p))]
+            CalibrationMethod::A => vec![(p / (1.0 - p)).ln()],                // [log(p/(1-p))]
+            CalibrationMethod::B => vec![-((1.0 - p) / p).ln()],               // [-log((1-p)/p)]
         }
     }
 
@@ -304,7 +315,7 @@ mod tests {
     use approx::assert_relative_eq;
 
     fn create_test_model() -> BetaCalModel {
-        BetaCalModel::new(vec![1.2345, -0.6789], 0.0, CalibrationMethod::AB)
+        BetaCalModel::new(vec![1.2345, -0.6789], 0.0, CalibrationMethod::ABM)
     }
 
     #[test]
@@ -384,9 +395,11 @@ mod tests {
     #[test]
     fn test_different_methods() {
         let test_cases = vec![
+            (CalibrationMethod::ABM, vec![1.0, -0.5]),
+            (CalibrationMethod::AB, vec![1.0, -0.5]),
+            (CalibrationMethod::AM, vec![1.0]),
             (CalibrationMethod::A, vec![1.0]),
             (CalibrationMethod::B, vec![-1.0]),
-            (CalibrationMethod::AB, vec![1.0, -0.5]),
         ];
 
         for (method, weights) in test_cases {

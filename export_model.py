@@ -104,21 +104,30 @@ def determine_method(parameters, n_weights):
         n_weights: Number of logistic regression weights
     
     Returns:
-        str: Method identifier for Rust ("A", "B", or "AB")
+        str: Method identifier for Rust ("A", "B", "AB", "AM", or "ABM")
     """
     
     # Map based on parameter string and weight count
-    if parameters == "a" or (parameters in ["am"] and n_weights == 1):
-        return "A"  # Only log(p) feature
-    elif parameters == "b" or n_weights == 1:
-        # Note: Pure "b" method is rare, usually combined with others
-        return "B"  # Only log(1-p) feature  
-    elif parameters in ["abm", "ab"] or n_weights == 2:
-        return "AB"  # Both log(p) and log(1-p) features
+    if parameters == "abm" and n_weights == 2:
+        return "ABM"  # 3-parameter model: [log(p), -log(1-p)]
+    elif parameters == "ab" and n_weights == 2:
+        return "AB"   # 2-parameter model: [log(2p), log(2(1-p))]
+    elif parameters == "am" and n_weights == 1:
+        return "AM"   # 2-parameter model: [log(p/(1-p))]
+    elif parameters == "a" and n_weights == 1:
+        return "A"    # 1-parameter model: [log(p/(1-p))]
+    elif parameters == "b" and n_weights == 1:
+        return "B"    # 1-parameter model: [-log((1-p)/p)]
     else:
-        # Default to AB for safety
-        print(f"Warning: Unknown parameter combination '{parameters}' with {n_weights} weights, defaulting to AB")
-        return "AB"
+        # Try to infer from weight count and warn
+        if n_weights == 2:
+            print(f"Warning: Unknown parameter '{parameters}' with 2 weights, defaulting to ABM")
+            return "ABM"
+        elif n_weights == 1:
+            print(f"Warning: Unknown parameter '{parameters}' with 1 weight, defaulting to A")
+            return "A"
+        else:
+            raise ValueError(f"Cannot determine method for parameters '{parameters}' with {n_weights} weights")
 
 
 def generate_test_cases(calibrator, n_cases=20):

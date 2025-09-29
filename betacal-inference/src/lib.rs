@@ -29,6 +29,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use thiserror::Error;
 
+#[cfg(feature = "simd")]
+use wide::{f64x4, CmpGe};
+
 /// Errors that can occur during inference
 #[derive(Error, Debug)]
 pub enum InferenceError {
@@ -136,30 +139,166 @@ impl BetaCalModel {
             return Err(InferenceError::EmptyInput);
         }
 
-        let mut calibrated = Vec::with_capacity(probabilities.len());
+        // Route to specialized implementations to eliminate branching overhead
+        match self.method {
+            CalibrationMethod::ABM => self.predict_abm_optimized(probabilities),
+            CalibrationMethod::AB => self.predict_ab_optimized(probabilities),
+            CalibrationMethod::AM => self.predict_am_optimized(probabilities),
+            CalibrationMethod::A => self.predict_a_optimized(probabilities),
+            CalibrationMethod::B => self.predict_b_optimized(probabilities),
+        }
+    }
+
+    /// Optimized prediction for ABM method: [log(p), -log(1-p)]
+    #[inline]
+    fn predict_abm_optimized(&self, probabilities: &[f64]) -> Result<Vec<f64>, InferenceError> {
+        let mut result = Vec::with_capacity(probabilities.len());
+        let w0 = self.weights[0];
+        let w1 = self.weights[1];
+        let intercept = self.intercept;
 
         for &p in probabilities {
-            // Validate input
             if !p.is_finite() || p < 0.0 || p > 1.0 {
                 return Err(InferenceError::InvalidProbability(p));
             }
-
-            // Step 1: Numerical safety - clip to avoid log(0)
-            let p_safe = clip(p, 1e-15, 1.0 - 1e-15);
-
-            // Step 2: Feature transformation
-            let features = self.create_features(p_safe);
-
-            // Step 3: Logistic regression
-            let logit = self.compute_logit(&features);
-
-            // Step 4: Sigmoid activation
-            let p_cal = sigmoid(logit);
-
-            calibrated.push(p_cal);
+            
+            let p_safe = p.clamp(1e-15, 1.0 - 1e-15);
+            let logit = w0 * p_safe.ln() + w1 * (-(1.0 - p_safe).ln()) + intercept;
+            result.push(fast_sigmoid(logit));
         }
+        
+        Ok(result)
+    }
 
-        Ok(calibrated)
+    /// Optimized prediction for AB method: [log(2p), log(2(1-p))]
+    #[inline]
+    fn predict_ab_optimized(&self, probabilities: &[f64]) -> Result<Vec<f64>, InferenceError> {
+        let mut result = Vec::with_capacity(probabilities.len());
+        let w0 = self.weights[0];
+        let w1 = self.weights[1];
+        let intercept = self.intercept;
+
+        for &p in probabilities {
+            if !p.is_finite() || p < 0.0 || p > 1.0 {
+                return Err(InferenceError::InvalidProbability(p));
+            }
+            
+            let p_safe = p.clamp(1e-15, 1.0 - 1e-15);
+            let logit = w0 * (2.0 * p_safe).ln() + w1 * (2.0 * (1.0 - p_safe)).ln() + intercept;
+            result.push(fast_sigmoid(logit));
+        }
+        
+        Ok(result)
+    }
+
+    /// Optimized prediction for AM method: [log(p/(1-p))]
+    #[inline]
+    fn predict_am_optimized(&self, probabilities: &[f64]) -> Result<Vec<f64>, InferenceError> {
+        // Use SIMD for large batches when feature is enabled
+        #[cfg(feature = "simd")]
+        if probabilities.len() >= 16 {
+            return self.predict_am_simd(probabilities);
+        }
+        
+        // Fallback to scalar implementation
+        let mut result = Vec::with_capacity(probabilities.len());
+        let w = self.weights[0];
+        let intercept = self.intercept;
+
+        for &p in probabilities {
+            if !p.is_finite() || p < 0.0 || p > 1.0 {
+                return Err(InferenceError::InvalidProbability(p));
+            }
+            
+            let p_safe = p.clamp(1e-15, 1.0 - 1e-15);
+            let logit = w * (p_safe / (1.0 - p_safe)).ln() + intercept;
+            result.push(fast_sigmoid(logit));
+        }
+        
+        Ok(result)
+    }
+
+    #[cfg(feature = "simd")]
+    /// SIMD-optimized prediction for AM method
+    #[inline]
+    fn predict_am_simd(&self, probabilities: &[f64]) -> Result<Vec<f64>, InferenceError> {
+        let mut result = Vec::with_capacity(probabilities.len());
+        let w_vec = f64x4::splat(self.weights[0]);
+        let intercept_vec = f64x4::splat(self.intercept);
+        let one_vec = f64x4::splat(1.0);
+        
+        // Validate all inputs first
+        for &p in probabilities {
+            if !p.is_finite() || p < 0.0 || p > 1.0 {
+                return Err(InferenceError::InvalidProbability(p));
+            }
+        }
+        
+        // Process in chunks of 4
+        for chunk in probabilities.chunks_exact(4) {
+            let p_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let p_safe = clamp_simd(p_vec, 1e-15, 1.0 - 1e-15);
+            
+            // Compute log(p/(1-p)) vectorized
+            let ratio = p_safe / (one_vec - p_safe);
+            let log_ratio = ratio.ln();
+            let logit = w_vec * log_ratio + intercept_vec;
+            
+            // Apply sigmoid
+            let sigmoid_result = fast_sigmoid_simd(logit);
+            let results_array = sigmoid_result.to_array();
+            result.extend_from_slice(&results_array);
+        }
+        
+        // Handle remaining elements (scalar processing)
+        let remainder = probabilities.chunks_exact(4).remainder();
+        for &p in remainder {
+            let p_safe = p.clamp(1e-15, 1.0 - 1e-15);
+            let logit = self.weights[0] * (p_safe / (1.0 - p_safe)).ln() + self.intercept;
+            result.push(fast_sigmoid(logit));
+        }
+        
+        Ok(result)
+    }
+
+    /// Optimized prediction for A method: [log(p/(1-p))]
+    #[inline]
+    fn predict_a_optimized(&self, probabilities: &[f64]) -> Result<Vec<f64>, InferenceError> {
+        let mut result = Vec::with_capacity(probabilities.len());
+        let w = self.weights[0];
+        let intercept = self.intercept;
+
+        for &p in probabilities {
+            if !p.is_finite() || p < 0.0 || p > 1.0 {
+                return Err(InferenceError::InvalidProbability(p));
+            }
+            
+            let p_safe = p.clamp(1e-15, 1.0 - 1e-15);
+            let logit = w * (p_safe / (1.0 - p_safe)).ln() + intercept;
+            result.push(fast_sigmoid(logit));
+        }
+        
+        Ok(result)
+    }
+
+    /// Optimized prediction for B method: [-log((1-p)/p)]
+    #[inline]
+    fn predict_b_optimized(&self, probabilities: &[f64]) -> Result<Vec<f64>, InferenceError> {
+        let mut result = Vec::with_capacity(probabilities.len());
+        let w = self.weights[0];
+        let intercept = self.intercept;
+
+        for &p in probabilities {
+            if !p.is_finite() || p < 0.0 || p > 1.0 {
+                return Err(InferenceError::InvalidProbability(p));
+            }
+            
+            let p_safe = p.clamp(1e-15, 1.0 - 1e-15);
+            let logit = w * (-((1.0 - p_safe) / p_safe).ln()) + intercept;
+            result.push(fast_sigmoid(logit));
+        }
+        
+        Ok(result)
     }
 
     /// Predict calibrated probability for a single input
@@ -297,9 +436,9 @@ fn clip(value: f64, min: f64, max: f64) -> f64 {
     value.max(min).min(max)
 }
 
-/// Numerically stable sigmoid function
-#[inline]
-fn sigmoid(x: f64) -> f64 {
+/// Optimized numerically stable sigmoid function
+#[inline(always)]
+fn fast_sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
         let exp_neg_x = (-x).exp();
         1.0 / (1.0 + exp_neg_x)
@@ -307,6 +446,37 @@ fn sigmoid(x: f64) -> f64 {
         let exp_x = x.exp();
         exp_x / (1.0 + exp_x)
     }
+}
+
+#[cfg(feature = "simd")]
+/// SIMD vectorized sigmoid function - processes 4 values at once
+#[inline(always)]
+fn fast_sigmoid_simd(x: f64x4) -> f64x4 {
+    let zero = f64x4::splat(0.0);
+    let one = f64x4::splat(1.0);
+    
+    // Use conditional logic for numerically stable sigmoid
+    let positive_mask = x.cmp_ge(zero);
+    
+    // For x >= 0: 1 / (1 + exp(-x))
+    let exp_neg_x = (-x).exp();
+    let positive_result = one / (one + exp_neg_x);
+    
+    // For x < 0: exp(x) / (1 + exp(x))
+    let exp_x = x.exp();
+    let negative_result = exp_x / (one + exp_x);
+    
+    // Blend results based on sign
+    positive_mask.blend(positive_result, negative_result)
+}
+
+#[cfg(feature = "simd")]
+/// SIMD vectorized clamp function
+#[inline(always)]
+fn clamp_simd(x: f64x4, min_val: f64, max_val: f64) -> f64x4 {
+    let min_vec = f64x4::splat(min_val);
+    let max_vec = f64x4::splat(max_val);
+    x.max(min_vec).min(max_vec)
 }
 
 #[cfg(test)]

@@ -16,3 +16,27 @@ __pycache__
 # Python Environments
 venv
 .venv
+
+# Rust build artifacts
+/target/
+/betacal-inference/target/
+Cargo.lock
+/betacal-inference/Cargo.lock
+
+# Rust backup files
+**/*.rs.bk
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Benchmark and profiling results
+*.prof
+perf.data*
+flamegraph.svg
